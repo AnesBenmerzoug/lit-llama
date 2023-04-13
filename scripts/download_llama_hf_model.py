@@ -6,7 +6,7 @@ from transformers import LlamaTokenizer, LlamaForCausalLM
 
 def download_hf_model(
     model_name: str = "decapoda-research/llama-7b-hf",
-    model_dir: Path = Path("/mnt/data/llama_hf_models/llama-7b-hf"),
+    model_dir: Path = Path("checkpoints/llama-7b-hf"),
 ) -> None:
     print("Downloading model weights and tokenzier from pretrained LLaMA from HuggingFace")
 
