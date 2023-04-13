@@ -1,3 +1,5 @@
+> **FORK of Lit-LLaMA**
+
 <div align="center">
 <img src="https://pl-public-data.s3.amazonaws.com/assets_lightning/Lit_LLaMA_Badge3x.png" alt="Lit-LLaMA" width="128"/>
 
@@ -49,55 +51,96 @@ This "taints" any other code and prevents integration with the rest of the ecosy
 
 ## Setup
 
-Clone the repo
+- Clone the repo
 
-```bash
-git clone https://github.com/Lightning-AI/lit-llama
-cd lit-llama
-```
+- Install dependencies
 
-install dependencies
+   ```bash
+   pip install -r requirements.txt
+   ```
 
-```bash
-pip install -r requirements.txt
-```
-
-You are all set! 🎉
+- You are all set! 🎉
 
 &nbsp;
 
 ## Use the model
 
-To generate text predictions, download the model weights following the instructions on the official [LLaMA repository](https://github.com/facebookresearch/llama).
+To generate text predictions, we have to first download the model weights following these instructions
 
-Once downloaded, you should have a folder like this:
+### Original Model Weights
 
-```text
-checkpoints/llama
-├── 7B
-│   ├── checklist.chk
-│   ├── consolidated.00.pth
-│   └── params.json
-├── 13B
-│   ...
-├── tokenizer_checklist.chk
-└── tokenizer.model
-```
+- Request the model weights from the official [LLaMA repository](https://github.com/facebookresearch/llama) and put them under `checkpoints/llama`.
 
-Convert the weights to the Lit-LLaMA format:
+- Once downloaded, you should have a folder like this:
 
-```bash
-python scripts/convert_checkpoint.py \
-    --output_dir checkpoints/lit-llama \
-    --ckpt_dir checkpoints/llama \
-    --tokenizer_path checkpoints/llama/tokenizer.model \
-    --model_size 7B
-```
+  ```text
+  checkpoints/llama
+  ├── 7B
+  │   ├── checklist.chk
+  │   ├── consolidated.00.pth
+  │   └── params.json
+  ├── 13B
+  │   ...
+  ├── tokenizer_checklist.chk
+  └── tokenizer.model
+  ```
+
+- Convert the weights to the Lit-LLaMA format:
+
+  ```bash
+  python scripts/convert_checkpoint.py \
+      --output_dir checkpoints/lit-llama \
+      --ckpt_dir checkpoints/llama \
+      --tokenizer_path checkpoints/llama/tokenizer.model \
+      --model_size 7B
+  ```
+
+- The models weights can be found under `checkpoints/lit-llama`
+
+### HuggingFace Model Weights
+
+- Download the model weights from the [huggingface website](https://huggingface.co/models?search=llama%20hf) and put them under `/mnt/data/llama_hf_models`
+
+  - Once downloaded, you should have a folder like this:
+
+    ```text
+    /mnt/data/llama_hf_models
+    ├── llama-7b-hf
+    │   ├── generation_config.json
+    │   ├── LICENSE
+    │   ├── pytorch_model-00001-of-00033.bin
+    │   │   ...
+    │   ├── pytorch_model-00033-of-00033.bin
+    │   ├── pytorch_model.bin.index.json
+    │   ├── README.md
+    │   ├── special_tokens_map.json
+    │   ├── tokenizer_config.json
+    │   └── tokenizer.model
+    ├── llama-13b-hf
+    ├── llama-30b-hf
+    ├── llama-65b-hf
+    ```
+
+- Convert the weights to the Lit-LLaMA format:
+
+  ```bash
+  python scripts/convert_hf_checkpoint.py \
+      --lit_checkpoint /mnt/data/lit_llama/lit_llama_7b.ckpt \
+      --hf_checkpoint_path /mnt/data/llama_hf_models/llama-7b-hf/ \
+      --model_size 7B
+  ```
+
+- The models weights can be found under `checkpoints/lit-llama`
+
+### Inference
 
 Run inference:
 
 ```bash
-python generate.py --prompt "Hello, my name is"
+python generate.py \
+  --checkpoint_path /mnt/data/lit_llama/lit_llama_7b.ckpt \
+  --tokenizer_path /mnt/data/llama_hf_models/llama-7b-hf/tokenizer.model \
+  --prompt "Hello, my name is"
 ```
 
 This will run the 7B model and require ~26 GB of GPU memory (A100 GPU).
