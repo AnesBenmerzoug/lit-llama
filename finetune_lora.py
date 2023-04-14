@@ -4,12 +4,19 @@ Instruction-tuning with LoRA on the Alpaca dataset.
 Note: If you run into a CUDA error "Expected is_sm80 to be true, but got false", uncomment the line
 `torch.backends.cuda.enable_flash_sdp(False)` in the script below (see https://github.com/Lightning-AI/lit-llama/issues/101).
 """
+import logging
 import os
 import time
+from pathlib import Path
+from typing import Optional
 
 import lightning as L
 import numpy as np
 import torch
+from deepspeed.ops.adam import DeepSpeedCPUAdam, FusedAdam
+from lightning.fabric.loggers import TensorBoardLogger
+from lightning.fabric.strategies import DeepSpeedStrategy
+from lightning.fabric.loggers.logger import rank_zero_experiment
 
 from generate import generate
 from lit_llama.lora import mark_only_lora_as_trainable, lora, lora_state_dict
@@ -18,15 +25,15 @@ from lit_llama.tokenizer import Tokenizer
 from lit_llama.utils import save_model_checkpoint
 from scripts.prepare_alpaca import generate_prompt
 
+logging.basicConfig(level=logging.INFO)
 
-out_dir = "out/lora/alpaca"
-eval_interval = 100
-save_interval = 100
+eval_interval = 10
+save_interval = 20
 eval_iters = 100
-log_interval = 1
+log_interval = 2
 
 # Hyperparameters
-learning_rate = 3e-4
+learning_rate = 1e-5
 batch_size = 128
 micro_batch_size = 4
 gradient_accumulation_steps = batch_size // micro_batch_size
@@ -39,37 +46,65 @@ lora_dropout = 0.05
 warmup_steps = 100
 
 
-def main():
-    fabric = L.Fabric(accelerator="cuda", devices=1, precision="bf16-mixed")
+def main(
+    output_dir: Path = Path("out/lora/llama-dolly"),
+    checkpoint_path: Path = Path("checkpoints/lit-llama/lit_llama_7b.ckpt"),
+    tokenizer_path: Path = Path("checkpoints/llama/tokenizer.model"),
+    dataset_dir: Path = Path("data/dolly"),
+    offload_optimizer: bool = False,
+):
+    logger = TensorBoardLogger(root_dir="out/logs")
+
+    fabric = L.Fabric(
+        strategy=DeepSpeedStrategy(stage=3, offload_optimizer=offload_optimizer, initial_scale_power=8),
+        accelerator="auto",
+        devices=2,
+        precision="32",
+        loggers=logger,
+    )
     fabric.launch()
     fabric.seed_everything(1337 + fabric.global_rank)
 
     if fabric.global_rank == 0:
-        os.makedirs(out_dir, exist_ok=True)
+        os.makedirs(output_dir, exist_ok=True)
 
-    train_data, val_data = load_datasets()
+    train_data, val_data = load_datasets(dataset_dir)
 
     config = LLaMAConfig.from_name("7B")
     config.block_size = block_size
 
-    checkpoint = torch.load("checkpoints/lit-llama/7B/lit-llama.pth")
-
-    with fabric.device, lora(r=lora_r, alpha=lora_alpha, dropout=lora_dropout, enabled=True):
-        torch.set_default_tensor_type(torch.HalfTensor)
-        model = LLaMA(config).bfloat16()
-        torch.set_default_tensor_type(torch.FloatTensor)
+    with fabric.device, lora(
+        r=lora_r, alpha=lora_alpha, dropout=lora_dropout, enabled=True
+    ):
+        # torch.set_default_tensor_type(torch.HalfTensor)
+        model = LLaMA(config)  # .bfloat16()
+        # torch.set_default_tensor_type(torch.FloatTensor)
         # strict=False because missing keys due to LoRA weights not contained in checkpoint state
-        model.load_state_dict(checkpoint, strict=False) 
-    
+        checkpoint = torch.load(checkpoint_path)
+        model.load_state_dict(checkpoint, strict=False)
+
     mark_only_lora_as_trainable(model)
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+    if offload_optimizer:
+        optimizer = DeepSpeedCPUAdam(model.parameters(), lr=learning_rate)
+    else:
+        # optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+        optimizer = FusedAdam(model.parameters(), lr=learning_rate)
+
     model, optimizer = fabric.setup(model, optimizer)
-    train(fabric, model, optimizer, train_data, val_data)
+    train(
+        fabric,
+        model,
+        optimizer,
+        train_data,
+        val_data,
+        output_dir=output_dir,
+        tokenizer_path=tokenizer_path,
+    )
 
     # Save the final LoRA checkpoint at the end of training
     checkpoint = lora_state_dict(model)
-    fabric.save(os.path.join(out_dir, "lit-llama-lora-finetuned.pth"), checkpoint)
+    fabric.save(os.path.join(output_dir, "lit-llama-lora-finetuned.pth"), checkpoint)
 
 
 def train(
@@ -78,6 +113,9 @@ def train(
     optimizer: torch.optim.Optimizer,
     train_data: np.ndarray,
     val_data: np.ndarray,
+    *,
+    output_dir: Path,
+    tokenizer_path: Path,
 ) -> None:
     """The training loop.
 
@@ -90,40 +128,55 @@ def train(
         if step_count <= warmup_steps:
             # linear warmup
             lr = learning_rate * step_count / warmup_steps
+            lr = max(lr, 1e-9)
             for param_group in optimizer.param_groups:
-                param_group['lr'] = lr
+                param_group["lr"] = lr
+
+        fabric.log("lr", lr, step=iter_num)
 
         t0 = time.time()
 
-        input_ids, targets = get_batch(fabric, train_data)
-        logits = model(input_ids)
-        loss = loss_fn(logits, targets)
-        fabric.backward(loss)
+        is_accumulating = (iter_num + 1) % gradient_accumulation_steps != 0
 
-        if (iter_num + 1) % gradient_accumulation_steps == 0:
+        with fabric.no_backward_sync(model, enabled=is_accumulating):
+            input_ids, targets = get_batch(fabric, train_data)
+            logits = model(input_ids)
+            loss = loss_fn(logits, targets)
+            fabric.log("training_loss", loss, step=iter_num)
+            fabric.backward(loss)
+
+        if not is_accumulating:
             optimizer.step()
             optimizer.zero_grad()
             step_count += 1
-                
+            fabric.log("step_count", step_count, step=iter_num)
+
             if step_count % eval_interval == 0:
-                val_loss = validate(fabric, model, val_data)
+                val_loss = validate(
+                    fabric, model, val_data, tokenizer_path=tokenizer_path, step=iter_num,
+                )
+                fabric.log("validation_loss", loss, step=iter_num)
                 fabric.print(f"step {iter_num}: val loss {val_loss:.4f}")
                 fabric.barrier()
 
             if step_count % save_interval == 0:
-                print(f"Saving LoRA weights to {out_dir}")
+                print(f"Saving LoRA weights to {output_dir}")
                 # We are only saving the LoRA weights
                 # TODO: Provide a function/script to merge the LoRA weights with pretrained weights
                 checkpoint = lora_state_dict(model)
-                fabric.save(os.path.join(out_dir, f"iter-{iter_num:06d}-ckpt.pth"), checkpoint)
+                fabric.save(
+                    os.path.join(output_dir, f"iter-{iter_num:06d}-ckpt.pt"), state={"model": model, "checkpoint": checkpoint}
+                )
 
         dt = time.time() - t0
         if iter_num % log_interval == 0:
-            fabric.print(f"iter {iter_num}: loss {loss.item():.4f}, time: {dt*1000:.2f}ms")
+            fabric.print(
+                f"iter {iter_num}: loss {loss.item():.4f}, time: {dt*1000:.2f}ms"
+            )
 
 
-def generate_response(model, instruction):
-    tokenizer = Tokenizer("checkpoints/lit-llama/tokenizer.model")
+def generate_response(model, instruction, *, tokenizer_path: Path):
+    tokenizer = Tokenizer(tokenizer_path)
     sample = {"instruction": instruction, "input": ""}
     prompt = generate_prompt(sample)
     encoded = tokenizer.encode(prompt, bos=True, eos=False)
@@ -137,11 +190,18 @@ def generate_response(model, instruction):
         max_new_tokens=100,
     )
     output = tokenizer.decode(output[0].cpu())
-    return output # output.split("### Response:")[1].strip()
+    return output  # output.split("### Response:")[1].strip()
 
 
 @torch.no_grad()
-def validate(fabric: L.Fabric, model: torch.nn.Module, val_data: np.ndarray) -> torch.Tensor:
+def validate(
+    fabric: L.Fabric,
+    model: torch.nn.Module,
+    val_data: np.ndarray,
+    *,
+    tokenizer_path: Path,
+    step: int,
+) -> torch.Tensor:
     fabric.print("Validating ...")
     model.eval()
     losses = torch.zeros(eval_iters)
@@ -153,22 +213,32 @@ def validate(fabric: L.Fabric, model: torch.nn.Module, val_data: np.ndarray) -> 
     out = losses.mean()
 
     # produce an example:
-    instruction = "Recommend a movie for me to watch during the weekend and explain the reason."
-    
-    output = generate_response(model, instruction)
+    instruction = (
+        "Recommend a movie for me to watch during the weekend and explain the reason."
+    )
+
+    output = generate_response(model, instruction, tokenizer_path=tokenizer_path)
+    log_text(fabric, "validation_prompt", instruction, step=step)
+    log_text(fabric, "validation_response", output, step=step)
+
+    fabric.print("=" * 32)
     fabric.print(instruction)
     fabric.print(output)
+    fabric.print("=" * 32)
 
     model.train()
     return out.item()
+
 
 def loss_fn(logits, targets):
     # shift the targets such that output n predicts token n+1
     logits = logits[..., :-1, :].contiguous()
     targets = targets[..., 1:].contiguous()
-    loss = torch.nn.functional.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+    loss = torch.nn.functional.cross_entropy(
+        logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1
+    )
     return loss
-    
+
 
 def get_batch(fabric: L.Fabric, data: list):
     ix = torch.randint(len(data), (micro_batch_size,))
@@ -189,14 +259,23 @@ def get_batch(fabric: L.Fabric, data: list):
     return x, y
 
 
-def load_datasets(data_dir: str = "data/alpaca"):
+def load_datasets(data_dir: Path = "data/dolly"):
     train_data = torch.load(os.path.join(data_dir, "train.pt"))
     val_data = torch.load(os.path.join(data_dir, "test.pt"))
     return train_data, val_data
 
 
+@rank_zero_experiment
+def log_text(fabric: L.Fabric, tag: str, text_string: str, step: Optional[int] = None):
+    for logger in fabric.loggers:
+        if isinstance(logger, TensorBoardLogger):
+            logger.experiment.add_text(tag, text_string, global_step=step)
+
+
 if __name__ == "__main__":
     # Uncomment this line if you see an error: "Expected is_sm80 to be true, but got false"
     # torch.backends.cuda.enable_flash_sdp(False)
+    from jsonargparse import CLI
+
     torch.set_float32_matmul_precision("high")
-    main()
+    CLI(main)
