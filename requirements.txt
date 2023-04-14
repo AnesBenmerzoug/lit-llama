@@ -1,6 +1,8 @@
 torch>=2.0.0
 lightning>=2.0.0
 sentencepiece
+tensorboard
+deepspeed
 # TODO: replace this once a version after 4.27 is released
 git+https://github.com/huggingface/transformers  # convert_hf_checkpoint.py
 tqdm  # convert_checkpoint.py
