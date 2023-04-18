@@ -16,11 +16,10 @@ import torch
 from deepspeed.ops.adam import DeepSpeedCPUAdam, FusedAdam
 from lightning.fabric.loggers import TensorBoardLogger
 from lightning.fabric.strategies import DeepSpeedStrategy
-from lightning.fabric.loggers.logger import rank_zero_experiment
 
 from generate import generate
 from lit_llama.lora import mark_only_lora_as_trainable, lora, lora_state_dict
-from lit_llama.model import LLaMA, LLaMAConfig
+from lit_llama.model import Block, LLaMA, LLaMAConfig
 from lit_llama.tokenizer import Tokenizer
 from lit_llama.utils import save_model_checkpoint
 from scripts.prepare_alpaca import generate_prompt
@@ -33,7 +32,7 @@ eval_iters = 100
 log_interval = 2
 
 # Hyperparameters
-learning_rate = 1e-5
+learning_rate = 3e-4
 batch_size = 128
 micro_batch_size = 4
 gradient_accumulation_steps = batch_size // micro_batch_size
@@ -55,10 +54,12 @@ def main(
 ):
     logger = TensorBoardLogger(root_dir="out/logs")
 
+    strategy = DeepSpeedStrategy(stage=3, offload_optimizer=offload_optimizer)
+
     fabric = L.Fabric(
-        strategy=DeepSpeedStrategy(stage=3, offload_optimizer=offload_optimizer, initial_scale_power=8),
-        accelerator="auto",
-        devices=2,
+        strategy=strategy,
+        accelerator="gpu",
+        devices=1,
         precision="32",
         loggers=logger,
     )
@@ -78,18 +79,21 @@ def main(
     ):
         # torch.set_default_tensor_type(torch.HalfTensor)
         model = LLaMA(config)  # .bfloat16()
-        # torch.set_default_tensor_type(torch.FloatTensor)
+        torch.set_default_tensor_type(torch.FloatTensor)
         # strict=False because missing keys due to LoRA weights not contained in checkpoint state
         checkpoint = torch.load(checkpoint_path)
         model.load_state_dict(checkpoint, strict=False)
 
     mark_only_lora_as_trainable(model)
 
+    num_params = sum([p.numel() for p in model.parameters() if p.requires_grad])
+    print(f"Number of trainable parameters: {num_params}")
+
     if offload_optimizer:
-        optimizer = DeepSpeedCPUAdam(model.parameters(), lr=learning_rate)
+        optimizer = DeepSpeedCPUAdam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
     else:
-        # optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
-        optimizer = FusedAdam(model.parameters(), lr=learning_rate)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+        # optimizer = FusedAdam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
 
     model, optimizer = fabric.setup(model, optimizer)
     train(
@@ -138,12 +142,13 @@ def train(
 
         is_accumulating = (iter_num + 1) % gradient_accumulation_steps != 0
 
+        input_ids, targets = get_batch(fabric, train_data)
+        logits = model(input_ids)
+        loss = loss_fn(logits, targets)
+        fabric.log("training_loss", loss, step=iter_num)
+
         with fabric.no_backward_sync(model, enabled=is_accumulating):
-            input_ids, targets = get_batch(fabric, train_data)
-            logits = model(input_ids)
-            loss = loss_fn(logits, targets)
-            fabric.log("training_loss", loss, step=iter_num)
-            fabric.backward(loss)
+            fabric.backward(loss / gradient_accumulation_steps)
 
         if not is_accumulating:
             optimizer.step()
@@ -155,18 +160,13 @@ def train(
                 val_loss = validate(
                     fabric, model, val_data, tokenizer_path=tokenizer_path, step=iter_num,
                 )
-                fabric.log("validation_loss", loss, step=iter_num)
+                fabric.log("validation_loss", val_loss, step=iter_num)
                 fabric.print(f"step {iter_num}: val loss {val_loss:.4f}")
                 fabric.barrier()
 
             if step_count % save_interval == 0:
                 print(f"Saving LoRA weights to {output_dir}")
-                # We are only saving the LoRA weights
-                # TODO: Provide a function/script to merge the LoRA weights with pretrained weights
-                checkpoint = lora_state_dict(model)
-                fabric.save(
-                    os.path.join(output_dir, f"iter-{iter_num:06d}-ckpt.pt"), state={"model": model, "checkpoint": checkpoint}
-                )
+                save_model_checkpoint(fabric, model, os.path.join(output_dir, f"iter-{iter_num:06d}.ckpt"))
 
         dt = time.time() - t0
         if iter_num % log_interval == 0:
@@ -218,7 +218,6 @@ def validate(
     )
 
     output = generate_response(model, instruction, tokenizer_path=tokenizer_path)
-    log_text(fabric, "validation_prompt", instruction, step=step)
     log_text(fabric, "validation_response", output, step=step)
 
     fabric.print("=" * 32)
@@ -265,11 +264,11 @@ def load_datasets(data_dir: Path = "data/dolly"):
     return train_data, val_data
 
 
-@rank_zero_experiment
-def log_text(fabric: L.Fabric, tag: str, text_string: str, step: Optional[int] = None):
-    for logger in fabric.loggers:
-        if isinstance(logger, TensorBoardLogger):
-            logger.experiment.add_text(tag, text_string, global_step=step)
+def log_text(fabric: L.Fabric, tag: str, text_string: str, step: Optional[int] = None) -> None:
+    if fabric.global_rank == 0:
+        for logger in fabric.loggers:
+            if isinstance(logger, TensorBoardLogger):
+                logger.experiment.add_text(tag, text_string, global_step=step)
 
 
 if __name__ == "__main__":
